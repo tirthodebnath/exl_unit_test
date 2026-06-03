@@ -40,16 +40,23 @@ NOTEBOOK_PATH = (
            .notebook().getContext().notebookPath().get()
 )
 REPO_PATH = "/Workspace" + os.path.dirname(NOTEBOOK_PATH).rsplit("/notebooks", 1)[0]
-WORK_DIR  = "/tmp/exl-pipeline"
+WORK_DIR  = "/tmp/exl_pipeline_work"
 
+# Remove only the specific work subdirectory, not /tmp/ itself
 if os.path.exists(WORK_DIR):
     shutil.rmtree(WORK_DIR)
+
 shutil.copytree(REPO_PATH, WORK_DIR)
 sys.path.insert(0, WORK_DIR)
+os.chdir(WORK_DIR)
 sys.dont_write_bytecode = True
 
 print(f"Repo root: {REPO_PATH}")
 print(f"Work dir:  {WORK_DIR}")
+
+# Sanity check
+import src.common.schemas
+print(f"src found: {src.common.schemas.__file__}")
 
 # COMMAND ----------
 
