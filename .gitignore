@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+metastore_db/
+derby.log
+spark-warehouse/
+.databricks/
+.venv/
+*.log
+.idea/
+.vscode/

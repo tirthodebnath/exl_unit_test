@@ -1,0 +1,16 @@
+bundle:
+  name: exl-unit-test
+targets:
+  default:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-252798a7-44b9.cloud.databricks.com
+resources:
+  jobs:
+    rcm_test_job:
+      name: rcm_unit_tests
+      tasks:
+        - task_key: run_pytest
+          notebook_task:
+            notebook_path: ../notebooks/run_tests_on_databricks
