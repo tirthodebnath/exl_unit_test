@@ -57,7 +57,7 @@ VALUES
     '/Volumes/workspace/tirtho_db/tirtho_uploaded_files/charges.csv',
     'workspace.tirtho_db.bronze_charges',
     'workspace.tirtho_db.silver_charges',
-    73,                         -- number of data columns in charges schema
+    75,                         -- number of data columns in charges schema (75 data + 2 audit = 77 total)
     true                        -- active = include in test runs
 ),
 (
@@ -67,7 +67,7 @@ VALUES
     '/Volumes/workspace/tirtho_db/tirtho_uploaded_files/patientvisits.csv',
     'workspace.tirtho_db.bronze_patientvisits',
     'workspace.tirtho_db.silver_patientvisits',
-    111,                        -- number of data columns in patientvisits schema
+    118,                        -- number of data columns in patientvisits schema (118 data + 2 audit = 120 total)
     true                        -- active = include in test runs
 );
 
