@@ -2,58 +2,66 @@
 tests/integration/conftest.py
 ==============================
 PURPOSE:
-    Shared fixtures for integration tests.
+    Shared fixtures and pytest hooks for integration tests.
 
-    Unlike the unit test conftest (which creates fake DataFrames in memory),
-    this conftest provides fixtures that read from REAL Delta tables. Every
-    fixture here returns a DataFrame backed by an actual Delta table that
-    was populated by run_pipeline.py.
+    Contains two sections:
+    1. FIXTURES      — SparkSession and real Delta table fixtures
+    2. PYTEST HOOKS  — automatically capture every test result and
+                       write to the audit Delta table
 
-IMPORTANT:
-    These fixtures assume run_pipeline.py has already been executed and
-    all 5 Delta tables exist in workspace.tirtho_db. If any table is missing,
-    the fixture will raise a clear error explaining which table to create.
+AUDIT TABLE AUTO-UPDATE:
+    The pytest_runtest_logreport hook fires after EVERY test that runs.
+    This means:
+    - When you add a new test to tests/integration/, it automatically
+      appears in the audit table on the next run
+    - No code changes needed — the hook captures everything
+    - New test = new row in test_audit_log automatically
 
-SPARK SESSION:
-    Uses getOrCreate() — on Databricks a SparkSession is already running.
-    We reuse it rather than creating a new one, which would be wasteful
-    and could conflict with the existing session's configurations.
+    The hook reads environment variables set by test_after_load_data.py:
+        AUDIT_RUN_ID         unique ID for this run
+        AUDIT_RUN_TIMESTAMP  when the run started
+        AUDIT_NOTEBOOK_LINK  URL to the notebook
+        AUDIT_TABLE          fully qualified audit Delta table name
 """
 
+import os
+import re
 import pytest
 from pyspark.sql import SparkSession
 
 
-# ---------------------------------------------------------------------------
-# SparkSession fixture
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# SECTION 1: SPARK SESSION AND TABLE FIXTURES
+# ===========================================================================
+
 @pytest.fixture(scope="session")
 def spark():
     """
     Return the active SparkSession on Databricks.
 
     WHY scope="session":
-        A SparkSession is expensive to create. Session scope means it is
-        created once and shared across all integration tests in the run.
-        This is safe because we never mutate the session's config in tests.
+        Created once, shared across all 48 integration tests.
+        Avoids the overhead of creating a new session per test.
+
+    WHY getOrCreate():
+        On Databricks a session is already running. We reuse it
+        rather than creating a new local session which cannot
+        read Delta tables from Unity Catalog.
 
     Returns:
-        SparkSession: The active (or newly created) Spark session.
+        SparkSession: Active Databricks Spark session.
     """
     return SparkSession.builder.getOrCreate()
 
 
-# ---------------------------------------------------------------------------
-# Real table fixtures — each reads from a live Delta table
-# ---------------------------------------------------------------------------
 @pytest.fixture(scope="session")
 def bronze_charges_real(spark):
     """
-    Return the real bronze_charges Delta table as a DataFrame.
+    Real bronze_charges Delta table as a DataFrame.
 
     WHY scope="session":
-        The Bronze table does not change during the test run. Loading it
-        once and reusing it avoids re-reading the Delta log on every test.
+        Table does not change during test run.
+        Load once, reuse across all 17 Bronze charges tests.
 
     Returns:
         DataFrame: All rows from workspace.tirtho_db.bronze_charges.
@@ -62,15 +70,14 @@ def bronze_charges_real(spark):
         return spark.table("workspace.tirtho_db.bronze_charges")
     except Exception as e:
         pytest.skip(
-            f"bronze_charges table not found. Run run_pipeline.py first. "
-            f"Error: {e}"
+            f"bronze_charges not found. Run run_pipeline.py first. Error: {e}"
         )
 
 
 @pytest.fixture(scope="session")
 def bronze_patientvisits_real(spark):
     """
-    Return the real bronze_patientvisits Delta table as a DataFrame.
+    Real bronze_patientvisits Delta table as a DataFrame.
 
     Returns:
         DataFrame: All rows from workspace.tirtho_db.bronze_patientvisits.
@@ -79,15 +86,14 @@ def bronze_patientvisits_real(spark):
         return spark.table("workspace.tirtho_db.bronze_patientvisits")
     except Exception as e:
         pytest.skip(
-            f"bronze_patientvisits table not found. Run run_pipeline.py first. "
-            f"Error: {e}"
+            f"bronze_patientvisits not found. Run run_pipeline.py first. Error: {e}"
         )
 
 
 @pytest.fixture(scope="session")
 def silver_charges_real(spark):
     """
-    Return the real silver_charges Delta table as a DataFrame.
+    Real silver_charges Delta table as a DataFrame.
 
     Returns:
         DataFrame: All rows from workspace.tirtho_db.silver_charges.
@@ -96,15 +102,14 @@ def silver_charges_real(spark):
         return spark.table("workspace.tirtho_db.silver_charges")
     except Exception as e:
         pytest.skip(
-            f"silver_charges table not found. Run run_pipeline.py first. "
-            f"Error: {e}"
+            f"silver_charges not found. Run run_pipeline.py first. Error: {e}"
         )
 
 
 @pytest.fixture(scope="session")
 def silver_patientvisits_real(spark):
     """
-    Return the real silver_patientvisits Delta table as a DataFrame.
+    Real silver_patientvisits Delta table as a DataFrame.
 
     Returns:
         DataFrame: All rows from workspace.tirtho_db.silver_patientvisits.
@@ -113,15 +118,14 @@ def silver_patientvisits_real(spark):
         return spark.table("workspace.tirtho_db.silver_patientvisits")
     except Exception as e:
         pytest.skip(
-            f"silver_patientvisits table not found. Run run_pipeline.py first. "
-            f"Error: {e}"
+            f"silver_patientvisits not found. Run run_pipeline.py first. Error: {e}"
         )
 
 
 @pytest.fixture(scope="session")
 def gold_real(spark):
     """
-    Return the real gold_rcm_summary Delta table as a DataFrame.
+    Real gold_rcm_summary Delta table as a DataFrame.
 
     Returns:
         DataFrame: All rows from workspace.tirtho_db.gold_rcm_summary.
@@ -130,22 +134,274 @@ def gold_real(spark):
         return spark.table("workspace.tirtho_db.gold_rcm_summary")
     except Exception as e:
         pytest.skip(
-            f"gold_rcm_summary table not found. Run run_pipeline.py first. "
-            f"Error: {e}"
+            f"gold_rcm_summary not found. Run run_pipeline.py first. Error: {e}"
         )
 
 
 @pytest.fixture(scope="session")
 def silver_and_gold_real(silver_charges_real, gold_real):
     """
-    Convenience fixture bundling Silver charges and Gold together.
+    Bundles Silver charges and Gold together for Gold tests.
 
     WHY:
-        All Gold reconciliation tests need both Silver charges and Gold.
-        This fixture avoids repeating the same two arguments in every
-        Gold test method signature.
+        All Gold reconciliation tests need both DataFrames.
+        One fixture instead of two arguments in every test.
 
     Returns:
         tuple: (silver_charges DataFrame, gold_rcm_summary DataFrame)
     """
     return silver_charges_real, gold_real
+
+
+# ===========================================================================
+# SECTION 2: PYTEST HOOKS FOR AUDIT TABLE
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Module-level list: collects all test results during the session.
+# Written to Delta in one batch when the session finishes.
+# Starts empty on every fresh pytest run.
+# ---------------------------------------------------------------------------
+_audit_results = []
+
+
+def _parse_test_info(nodeid: str) -> dict:
+    """
+    Parse layer, table_name, test_class, test_name from a pytest node ID.
+
+    WHY THIS EXISTS:
+        pytest identifies each test by a node ID string. We need to extract
+        structured fields from it to store in the audit table columns.
+
+    NODE ID FORMATS:
+        Bronze (parametrized):
+            tests/integration/test_bronze_realdata.py
+            ::TestBronzeIngestion
+            ::test_validate_file_format_compatibility[charges]
+
+        Silver (not parametrized):
+            tests/integration/test_silver_realdata.py
+            ::TestSilverServiceDate
+            ::test_service_date_is_datetime
+
+        Gold (not parametrized):
+            tests/integration/test_gold_realdata.py
+            ::TestGoldReconciliation
+            ::test_charge_count_matches_silver
+
+    Args:
+        nodeid (str): Full pytest node ID string.
+
+    Returns:
+        dict: layer, table_name, test_class, test_name.
+    """
+    # Split node ID into its components
+    parts = nodeid.split("::")
+
+    # ── Determine layer from file name ──────────────────────────────────────
+    file_name = parts[0].split("/")[-1].replace(".py", "")
+    # File names: test_bronze_realdata, test_silver_realdata, test_gold_realdata
+    if "bronze" in file_name:
+        layer = "bronze"
+    elif "silver" in file_name:
+        layer = "silver"
+    elif "gold" in file_name:
+        layer = "gold"
+    else:
+        layer = "unknown"
+
+    # ── Extract test class (second part) ────────────────────────────────────
+    test_class = parts[1] if len(parts) > 1 else "unknown"
+
+    # ── Extract test name and table_name ────────────────────────────────────
+    # The last part may have [table_name] suffix from pytest parametrize
+    test_part = parts[2] if len(parts) > 2 else parts[-1]
+
+    if "[" in test_part:
+        # Parametrized test — table name is inside the brackets
+        # e.g. test_validate_file_format_compatibility[charges]
+        test_name  = test_part.split("[")[0]
+        table_name = test_part.split("[")[1].rstrip("]")
+    else:
+        # Not parametrized — derive table name from layer
+        test_name = test_part
+        if layer == "silver":
+            table_name = "silver_charges"
+        elif layer == "gold":
+            table_name = "gold_rcm_summary"
+        else:
+            table_name = "unknown"
+
+    return {
+        "layer":      layer,
+        "table_name": table_name,
+        "test_class": test_class,
+        "test_name":  test_name,
+    }
+
+
+def pytest_runtest_logreport(report):
+    """
+    Pytest hook — fires after each phase of every test.
+
+    WHY THIS HOOK:
+        This is how pytest allows external systems to intercept test results.
+        It fires three times per test (setup, call, teardown). We only care
+        about the 'call' phase which is the actual test execution.
+
+        By appending to _audit_results here, we collect results for every
+        test automatically — including any new tests added in the future.
+        No manual registration needed. Add a test → it appears in the
+        audit table on the next run.
+
+    Args:
+        report: pytest's TestReport object containing all test result info.
+    """
+    # Only capture the 'call' phase — this is the actual test execution.
+    # 'setup' and 'teardown' phases are infrastructure, not the test itself.
+    if report.when != "call":
+        return
+
+    # Parse the structured fields from the pytest node ID
+    info = _parse_test_info(report.nodeid)
+
+    # ── Determine status and fail message ───────────────────────────────────
+    if report.passed:
+        status       = "PASS"
+        fail_message = None   # null in Delta — test passed, nothing to report
+
+    elif report.failed:
+        status = "FAIL"
+        # Extract the actual assertion error message.
+        # report.longrepr contains the full traceback — we take the last
+        # line which has the actual AssertionError message, truncated to
+        # 2000 chars to avoid Delta row size issues.
+        if report.longrepr:
+            full_msg     = str(report.longrepr)
+            fail_message = full_msg[-2000:] if len(full_msg) > 2000 else full_msg
+        else:
+            fail_message = "Test failed — no error message captured"
+
+    else:
+        # Skipped — e.g. Delta table not found, metadata table missing
+        status = "SKIP"
+        fail_message = str(report.longrepr)[:500] if report.longrepr else "Skipped"
+
+    # ── Build the audit row ─────────────────────────────────────────────────
+    _audit_results.append({
+        "run_id":           os.environ.get("AUDIT_RUN_ID",         "unknown"),
+        "run_timestamp":    os.environ.get("AUDIT_RUN_TIMESTAMP",  "unknown"),
+        "layer":            info["layer"],
+        "table_name":       info["table_name"],
+        "test_class":       info["test_class"],
+        "test_name":        info["test_name"],
+        "status":           status,
+        "fail_message":     fail_message,
+        "notebook_link":    os.environ.get("AUDIT_NOTEBOOK_LINK",  "unknown"),
+        "duration_seconds": round(report.duration, 3),
+    })
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """
+    Pytest hook — fires once after ALL tests have completed.
+
+    WHY HERE AND NOT IN pytest_runtest_logreport:
+        Writing to Delta on every single test would mean 48 separate Delta
+        write operations — very slow and creates 48 small files.
+        By collecting results in _audit_results and writing once here,
+        we do one efficient batch write at the end of the session.
+
+    WHAT IT DOES:
+        1. Checks if there are any results to write
+        2. Gets SparkSession
+        3. Creates a DataFrame from _audit_results
+        4. Appends to the audit Delta table
+        5. Prints confirmation with row count
+
+    FAILURE HANDLING:
+        If the write fails (e.g. audit table not created yet), it prints
+        a warning but does NOT fail the test run. The test results are
+        not lost — they are just not persisted to Delta.
+
+    Args:
+        session:    The pytest Session object.
+        exitstatus: The overall exit code (0=passed, 1=failed, etc.)
+    """
+    # Nothing to write if no tests ran (e.g. collection error)
+    if not _audit_results:
+        print("\nNo test results to write to audit table.")
+        return
+
+    audit_table = os.environ.get(
+        "AUDIT_TABLE",
+        "workspace.tirtho_db.test_audit_log"
+    )
+
+    try:
+        from pyspark.sql.types import (
+            FloatType, StringType, StructField, StructType
+        )
+
+        spark = SparkSession.builder.getOrCreate()
+
+        # ── Define schema explicitly ────────────────────────────────────────
+        # Explicit schema prevents Spark from inferring types incorrectly
+        # on edge cases like null fail_message or very short duration
+        schema = StructType([
+            StructField("run_id",           StringType(), True),
+            StructField("run_timestamp",    StringType(), True),
+            StructField("layer",            StringType(), True),
+            StructField("table_name",       StringType(), True),
+            StructField("test_class",       StringType(), True),
+            StructField("test_name",        StringType(), True),
+            StructField("status",           StringType(), True),
+            StructField("fail_message",     StringType(), True),
+            StructField("notebook_link",    StringType(), True),
+            StructField("duration_seconds", FloatType(),  True),
+        ])
+
+        # ── Convert results list to tuple list for createDataFrame ──────────
+        rows = [
+            (
+                r["run_id"],
+                r["run_timestamp"],
+                r["layer"],
+                r["table_name"],
+                r["test_class"],
+                r["test_name"],
+                r["status"],
+                r["fail_message"],
+                r["notebook_link"],
+                r["duration_seconds"],
+            )
+            for r in _audit_results
+        ]
+
+        # ── Write to Delta audit table (append — never overwrite) ────────────
+        # append mode preserves historical runs — you can track quality over time
+        df = spark.createDataFrame(rows, schema=schema)
+        df.write.format("delta").mode("append").saveAsTable(audit_table)
+
+        # Count pass/fail for summary
+        passed = sum(1 for r in _audit_results if r["status"] == "PASS")
+        failed = sum(1 for r in _audit_results if r["status"] == "FAIL")
+        skipped = sum(1 for r in _audit_results if r["status"] == "SKIP")
+
+        print(f"\n{'=' * 60}")
+        print(f"AUDIT LOG WRITTEN TO: {audit_table}")
+        print(f"  Run ID:  {_audit_results[0]['run_id']}")
+        print(f"  Total:   {len(rows)} tests")
+        print(f"  Passed:  {passed}")
+        print(f"  Failed:  {failed}")
+        print(f"  Skipped: {skipped}")
+        print(f"{'=' * 60}")
+
+    except Exception as e:
+        # Do not fail the test run if audit write fails
+        # Test results are printed above in the pytest output — not lost
+        print(f"\n{'!' * 60}")
+        print(f"WARNING: Could not write to audit table '{audit_table}'.")
+        print(f"Reason: {e}")
+        print(f"Run notebooks/create_audit_table.sql first.")
+        print(f"{'!' * 60}")
