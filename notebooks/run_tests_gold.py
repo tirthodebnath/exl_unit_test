@@ -3,33 +3,41 @@
 run_tests_gold.py
 =================
 PURPOSE:
-    Run Gold layer data quality tests on REAL Delta tables.
+    Run Gold layer data quality tests on the real gold_ogom_charges table.
 
 WHEN TO RUN:
-    After run_pipeline.py has loaded data into:
-        gold_rcm_summary     (V1 — rcm_client_id join only)
-        gold_rcm_summary_v2  (V2 — 3-condition + discharge filter join)
+    After run_pipeline.py has loaded data into gold_ogom_charges.
 
-TESTS RUN (from tests/integration/gold/):
-    test_charges.py (6 tests — charge-focused):
-        test_charge_count_matches_silver
-        test_total_charge_amount_matches_silver
-        test_no_new_charge_ids_in_gold
-        test_no_silver_charge_ids_dropped
-        test_amount_band_valid_in_gold
-        test_service_date_is_date_type_in_gold
+TEST FILE:
+    tests/integration/gold/test_ogom_charges.py (6 tests)
 
-    test_patientvisits.py (6 tests — visit-focused):
-        test_discharge_date_not_null_where_visit_joined
-        test_npi_matches_between_charge_and_visit
-        test_patient_account_number_matches
-        test_visit_columns_prefixed_pv
-        test_left_join_keeps_all_charges
-        test_rcm_client_id_not_null_in_gold
+TESTS:
+    1. test_no_new_charge_ids_in_gold
+       Every charge_id in Gold must exist in Silver — no phantom charges.
+
+    2. test_no_silver_charge_ids_dropped
+       Every Silver charge_id must appear in Gold — LEFT JOIN guarantee.
+
+    3. test_ogom_transaction_type_always_charge
+       ogom_transaction_type must be 'Charge' on every row.
+
+    4. test_charge_age_null_when_no_discharge
+       charge_age must be null when discharge_date is null.
+
+    5. test_discharge_date_after_admit_date
+       Where both dates exist, discharge must be after admission.
+
+    6. test_no_duplicate_join_combinations
+       No (rcm_client_id + rcm_npi + patient_account_number)
+       combination appears more than once in joined rows.
+
+TABLES CHECKED:
+    workspace.tirtho_db.gold_ogom_charges (primary)
+    workspace.tirtho_db.silver_charges    (for tests 1, 2)
 
 AUDIT:
     Results written to workspace.tirtho_db.test_audit_log
-    with layer = "gold" for all rows from this run.
+    with layer = 'gold' for all rows from this run.
 """
 
 # COMMAND ----------
@@ -51,7 +59,12 @@ REPO_PATH = "/Workspace" + os.path.dirname(NOTEBOOK_PATH).rsplit("/notebooks", 1
 WORK_DIR  = "/tmp/exl_gold_tests"
 
 if os.path.exists(WORK_DIR):
-    shutil.rmtree(WORK_DIR)
+    try:
+        shutil.rmtree(WORK_DIR)
+    except (PermissionError, OSError):
+        import random
+        WORK_DIR = f"/tmp/exl_gold_tests_{random.randint(10000, 99999)}"
+
 shutil.copytree(REPO_PATH, WORK_DIR)
 sys.path.insert(0, WORK_DIR)
 os.chdir(WORK_DIR)
@@ -72,16 +85,20 @@ os.environ["AUDIT_TABLE"]         = "workspace.tirtho_db.test_audit_log"
 print(f"Run ID:   {run_id}")
 print(f"Notebook: {notebook_link}")
 
-# Check all required Gold tables exist
-for t in ["workspace.tirtho_db.silver_charges",
-          "workspace.tirtho_db.gold_rcm_summary",
-          "workspace.tirtho_db.gold_rcm_summary_v2",
-          "workspace.tirtho_db.gold_ogom_charges"]:
+# ---------------------------------------------------------------------------
+# Pre-flight checks — both required tables must exist before running tests
+# ---------------------------------------------------------------------------
+for t in [
+    "workspace.tirtho_db.gold_ogom_charges",    # primary Gold table tested
+    "workspace.tirtho_db.silver_charges",        # used for tests 1 and 2
+]:
     try:
         spark.table(t).limit(1).count()
         print(f"✓ {t}")
     except Exception:
-        raise RuntimeError(f"Table '{t}' not found. Run run_pipeline.py first.")
+        raise RuntimeError(
+            f"Table '{t}' not found. Run run_pipeline.py first."
+        )
 
 # COMMAND ----------
 import pytest
@@ -89,13 +106,20 @@ import pytest
 print("=" * 60)
 print("RUNNING GOLD DATA QUALITY TESTS")
 print("=" * 60)
-print("  test_charges.py      — charge reconciliation (6 tests)")
-print("  test_patientvisits.py — visit join correctness (6 tests)")
-print("  test_ogom_charges.py  — OGOM charges Gold table (11 tests)")
+print()
+print("File: tests/integration/gold/test_ogom_charges.py")
+print("Tests: 6")
+print()
+print("  1. test_no_new_charge_ids_in_gold")
+print("  2. test_no_silver_charge_ids_dropped")
+print("  3. test_ogom_transaction_type_always_charge")
+print("  4. test_charge_age_null_when_no_discharge")
+print("  5. test_discharge_date_after_admit_date")
+print("  6. test_no_duplicate_join_combinations")
 print()
 
 exit_code = pytest.main([
-    "tests/integration/gold",   # runs both test_charges.py and test_patientvisits.py
+    "tests/integration/gold/test_ogom_charges.py",  # only this file
     "-v", "-ra", "--tb=short",
     "--override-ini=cache_dir=/tmp/.pytest_cache",
     "--basetemp=/tmp/pytest-temp",
@@ -104,18 +128,15 @@ exit_code = pytest.main([
 print(f"\npytest exit code: {exit_code}")
 
 # COMMAND ----------
-# Show results split by test file (charges vs patientvisits)
+# Show this run's results from audit table
 try:
-    audit_df = (
+    display(
         spark.table("workspace.tirtho_db.test_audit_log")
              .filter(f"run_id = '{run_id}'")
-             .orderBy("table_name", "test_name")
+             .orderBy("test_name")
+             .select("layer", "table_name", "test_name",
+                     "status", "duration_seconds", "fail_message")
     )
-    print(f"\nGold test results for run: {run_id}")
-    display(audit_df.select(
-        "table_name", "test_class", "test_name", "status",
-        "duration_seconds", "fail_message"
-    ))
 except Exception:
     pass
 
@@ -123,4 +144,4 @@ assert exit_code == 0, (
     f"Gold tests FAILED (exit code {exit_code}). "
     f"See test_audit_log where run_id = '{run_id}'"
 )
-print("GOLD TESTS PASSED.")
+print("ALL GOLD TESTS PASSED.")

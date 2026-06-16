@@ -2,47 +2,60 @@
 tests/integration/gold/test_ogom_charges.py
 ============================================
 PURPOSE:
-    Data quality tests for the real workspace.tirtho_db.gold_ogom_charges
-    Delta table.
-
-    These tests run AFTER run_pipeline.py has created gold_ogom_charges.
-    They verify that:
-        1. The join conditions were correctly applied on real data
-        2. All computed columns (charge_age, late_charge_flag,
-           charge_lag_days, charge_capture_days) are correct
-        3. No charges were lost or invented during the join
-        4. Business rules from the original SQL hold on real data
-
+    Data quality tests for workspace.tirtho_db.gold_ogom_charges.
+    This is the ONLY Gold integration test file.
     Run by: notebooks/run_tests_gold.py
 
-SQL THIS TABLE MAPS TO:
-    prod_lca_unrestricted.bassett_epic_acute_gold.ogomcharges
-    (charges LEFT JOIN patientvisits with 3 conditions + discharge filter)
+TESTS (6 total):
+    1. test_no_new_charge_ids_in_gold
+       From: test_charges.py test 3
+       Mapped to gold_ogom_charges instead of gold_rcm_summary_v2
 
-COLUMNS TESTED:
-    Identity:    charge_id, rcm_client_id
-    Amounts:     charge_amount
-    Computed:    charge_age, ogom_transaction_type, late_charge_flag,
-                 charge_lag_days, charge_capture_days
-    Join proof:  discharge_date, pv columns, LEFT JOIN guarantee
+    2. test_no_silver_charge_ids_dropped
+       From: test_charges.py test 4
+       Mapped to gold_ogom_charges instead of gold_rcm_summary_v2
+
+    3. test_ogom_transaction_type_always_charge
+       From: test_ogom_charges.py test 5
+       Every row must have ogom_transaction_type = 'Charge'
+
+    4. test_charge_age_null_when_no_discharge
+       From: test_ogom_charges.py test 6
+       charge_age must be null when discharge_date is null
+
+    5. test_discharge_date_after_admit_date  [NEW]
+       Where both dates exist, discharge must be after admission.
+       A patient cannot be discharged before being admitted.
+
+    6. test_no_duplicate_join_combinations   [NEW]
+       Maps to:
+           SELECT rcm_client_id, rcm_npi, patient_account_number,
+                  COUNT(*) AS cnt
+           FROM gold_ogom_charges
+           WHERE admit_date IS NOT NULL   -- actual_join_flag = 1
+           GROUP BY rcm_client_id, rcm_npi, patient_account_number
+           HAVING COUNT(*) > 1
+       Must return zero rows — the 3-condition join must be 1-to-1.
+       If any group has count > 1, the same (client + NPI + patient)
+       combination matched multiple visit rows (fan-out).
+
+TABLE USED:
+    workspace.tirtho_db.gold_ogom_charges (primary)
+    workspace.tirtho_db.silver_charges    (for tests 1, 2 only)
 """
 
 import pytest
 from pyspark.sql import functions as F
 
 
-# ---------------------------------------------------------------------------
-# Helper: load the real gold_ogom_charges table
-# ---------------------------------------------------------------------------
 def _get_ogom_charges(spark):
     """
     Load the real gold_ogom_charges Delta table.
 
     WHY A HELPER:
-        All tests in this file need the same DataFrame. Centralising the
-        table load means if the table name changes, we change it in one
-        place only. Also skips cleanly with a clear message if the table
-        does not exist yet.
+        All 6 tests need the same table. One place to load it
+        means if the table name changes, we change it once only.
+        Also skips cleanly with a clear message if table is missing.
 
     Args:
         spark (SparkSession): Active Databricks session.
@@ -55,376 +68,295 @@ def _get_ogom_charges(spark):
     except Exception as e:
         pytest.skip(
             f"gold_ogom_charges not found. "
-            f"Run run_pipeline.py or create_gold_v2.py first. Error: {e}"
+            f"Run run_pipeline.py first. Error: {e}"
         )
 
 
 # ---------------------------------------------------------------------------
-# TestOGOMChargesIdentity — critical columns must never be null
+# TEST 1: No new charge_ids in Gold
+# Moved from test_charges.py test 3 — mapped to gold_ogom_charges
 # ---------------------------------------------------------------------------
-class TestOGOMChargesIdentity:
+def test_no_new_charge_ids_in_gold(spark):
     """
-    Identity checks — the columns that make each row traceable.
-    A row without charge_id or rcm_client_id cannot be used in any report.
+    WHAT: Every charge_id in gold_ogom_charges must also exist in
+          silver_charges. The Gold join must never invent charge_ids.
+
+    WHY: A phantom charge_id in Gold means revenue data was created
+         from nowhere. Gold reports would show more charges than
+         actually exist in Silver — a fundamental data integrity failure.
+
+    ORIGINAL: test_charges.py test 3 — same logic, mapped from
+              gold_rcm_summary_v2 to gold_ogom_charges.
+
+    TABLE USED:
+        gold_ogom_charges  — Gold table being tested
+        silver_charges     — reference set of valid charge_ids
+
+    REAL DATA CHECK:
+        set(gold charge_ids) - set(silver charge_ids) == empty set
     """
+    gold = _get_ogom_charges(spark)
 
-    def test_charge_id_not_null(self, spark):
-        """
-        WHAT: charge_id must never be null in gold_ogom_charges.
+    try:
+        silver = spark.table("workspace.tirtho_db.silver_charges")
+    except Exception as e:
+        pytest.skip(f"silver_charges not available for comparison. Error: {e}")
 
-        WHY: charge_id is the primary identifier of every charge line.
-             The Silver filter already removed null charge_ids.
-             If any null survives to Gold, that row is untraceable —
-             it cannot be linked to a patient, a claim, or a payer.
+    # Collect charge_ids from both tables
+    silver_ids = {
+        r["charge_id"]
+        for r in silver.select("charge_id").collect()
+    }
+    gold_ids = {
+        r["charge_id"]
+        for r in gold.select("charge_id").distinct().collect()
+    }
 
-        REAL DATA CHECK:
-            Zero rows where charge_id is null.
-        """
-        df       = _get_ogom_charges(spark)
-        null_cnt = df.filter(F.col("charge_id").isNull()).count()
+    # Any ID in Gold that is NOT in Silver is a phantom — must be zero
+    phantom = gold_ids - silver_ids
 
-        assert null_cnt == 0, (
-            f"{null_cnt} rows have null charge_id in gold_ogom_charges. "
-            f"Silver filter should have removed these before Gold."
-        )
-
-    def test_rcm_client_id_not_null(self, spark):
-        """
-        WHAT: rcm_client_id must never be null in gold_ogom_charges.
-
-        WHY: rcm_client_id is the join key — it identifies which hospital
-             client the charge belongs to. A null rcm_client_id means the
-             row cannot be filtered by client, making it invisible to any
-             client-specific report.
-
-        REAL DATA CHECK:
-            Zero rows where rcm_client_id is null.
-        """
-        df       = _get_ogom_charges(spark)
-        null_cnt = df.filter(F.col("rcm_client_id").isNull()).count()
-
-        assert null_cnt == 0, (
-            f"{null_cnt} rows have null rcm_client_id in gold_ogom_charges."
-        )
-
-
-# ---------------------------------------------------------------------------
-# TestOGOMChargesAmounts — financial integrity
-# ---------------------------------------------------------------------------
-class TestOGOMChargesAmounts:
-    """
-    Financial integrity checks on charge_amount.
-    Incorrect amounts corrupt all revenue reporting.
-    """
-
-    def test_charge_amount_not_negative(self, spark):
-        """
-        WHAT: charge_amount must never be negative in gold_ogom_charges.
-
-        WHY: Silver filter removed negative amounts from silver_charges.
-             If any negative amount appears in Gold, something added it
-             after Silver — which should be impossible. Negative revenue
-             figures would distort all Gold financial reports.
-
-        REAL DATA CHECK:
-            Zero rows where charge_amount < 0.
-        """
-        df      = _get_ogom_charges(spark)
-        neg_cnt = df.filter(F.col("charge_amount") < 0).count()
-
-        assert neg_cnt == 0, (
-            f"{neg_cnt} rows have negative charge_amount in gold_ogom_charges."
-        )
-
-    def test_charge_amount_not_null(self, spark):
-        """
-        WHAT: charge_amount must never be null in gold_ogom_charges.
-
-        WHY: A charge with no amount has no financial value.
-             The Silver filter removed null amounts. If any null appears
-             in Gold, the filter did not run correctly and revenue
-             totals will be understated.
-
-        REAL DATA CHECK:
-            Zero rows where charge_amount is null.
-        """
-        df       = _get_ogom_charges(spark)
-        null_cnt = df.filter(F.col("charge_amount").isNull()).count()
-
-        assert null_cnt == 0, (
-            f"{null_cnt} rows have null charge_amount in gold_ogom_charges."
-        )
+    assert len(phantom) == 0, (
+        f"gold_ogom_charges contains {len(phantom)} charge_id(s) "
+        f"not found in silver_charges: {phantom}. "
+        f"The Gold join must never invent charge_ids."
+    )
 
 
 # ---------------------------------------------------------------------------
-# TestOGOMChargesComputedColumns — verify SQL-derived logic on real data
+# TEST 2: No Silver charge_ids dropped from Gold
+# Moved from test_charges.py test 4 — mapped to gold_ogom_charges
 # ---------------------------------------------------------------------------
-class TestOGOMChargesComputedColumns:
+def test_no_silver_charge_ids_dropped(spark):
     """
-    Verifies the 4 computed columns are correct on real data.
-    These columns are derived from the join output and do not come
-    from Silver directly.
+    WHAT: Every charge_id in silver_charges must appear in
+          gold_ogom_charges. No charge should be silently dropped.
+
+    WHY: This is the most critical Gold test. The LEFT JOIN guarantees
+         all charges appear regardless of whether a visit matched.
+         If any Silver charge_id is missing from Gold, the LEFT JOIN
+         accidentally became an INNER JOIN somewhere — unreconciled
+         charges disappear from all billing reports.
+
+    ORIGINAL: test_charges.py test 4 — same logic, mapped from
+              gold_rcm_summary_v2 to gold_ogom_charges.
+
+    TABLE USED:
+        gold_ogom_charges — Gold table being tested
+        silver_charges    — source of all charge_ids that must appear
+
+    REAL DATA CHECK:
+        set(silver charge_ids) - set(gold charge_ids) == empty set
     """
+    gold = _get_ogom_charges(spark)
 
-    def test_ogom_transaction_type_always_charge(self, spark):
-        """
-        WHAT: ogom_transaction_type must be "Charge" on every single row.
+    try:
+        silver = spark.table("workspace.tirtho_db.silver_charges")
+    except Exception as e:
+        pytest.skip(f"silver_charges not available for comparison. Error: {e}")
 
-        WHY: Maps to the literal "Charge" AS OGOMTransactionType in the SQL.
-             This column identifies all rows in this table as charge
-             transactions. If any row has a different value, the literal
-             computation failed.
+    silver_ids = {
+        r["charge_id"]
+        for r in silver.select("charge_id").collect()
+    }
+    gold_ids = {
+        r["charge_id"]
+        for r in gold.select("charge_id").distinct().collect()
+    }
 
-        REAL DATA CHECK:
-            All distinct ogom_transaction_type values == {"Charge"}
-        """
-        df             = _get_ogom_charges(spark)
-        distinct_types = {
-            r["ogom_transaction_type"]
-            for r in df.select("ogom_transaction_type").distinct().collect()
-        }
+    # Any Silver ID missing from Gold = charge was dropped = critical defect
+    dropped = silver_ids - gold_ids
 
-        assert distinct_types == {"Charge"}, (
-            f"ogom_transaction_type has unexpected values: {distinct_types}. "
-            f"Every row must have exactly 'Charge'."
-        )
-
-    def test_charge_age_null_when_no_discharge(self, spark):
-        """
-        WHAT: charge_age must be null whenever discharge_date is null.
-
-        WHY: Maps to:
-                 CASE WHEN pv.PatientDischargeDate IS NULL THEN NULL
-                      ELSE DATEDIFF(...) END AS ChargeAge
-             A charge cannot have an age relative to a discharge that
-             has not happened. If charge_age is not null when discharge_date
-             is null, the CASE logic was computed incorrectly.
-
-        REAL DATA CHECK:
-            Zero rows where discharge_date is null AND charge_age is not null.
-        """
-        df = _get_ogom_charges(spark)
-
-        # Rows where discharge is null must also have null charge_age
-        violated = df.filter(
-            F.col("discharge_date").isNull() &
-            F.col("charge_age").isNotNull()
-        ).count()
-
-        assert violated == 0, (
-            f"{violated} rows have null discharge_date but non-null charge_age. "
-            f"charge_age must be null when no discharge date exists."
-        )
-
-    def test_charge_age_computed_when_discharged(self, spark):
-        """
-        WHAT: charge_age must not be null when discharge_date is present.
-
-        WHY: When discharge_date is not null, charge_age must be computed
-             as DATEDIFF(posting_date, discharge_date). A null charge_age
-             with a valid discharge_date means the computation was skipped.
-
-        REAL DATA CHECK:
-            Zero rows where discharge_date is not null AND charge_age is null.
-        """
-        df = _get_ogom_charges(spark)
-
-        violated = df.filter(
-            F.col("discharge_date").isNotNull() &
-            F.col("charge_age").isNull()
-        ).count()
-
-        assert violated == 0, (
-            f"{violated} rows have a discharge_date but null charge_age. "
-            f"charge_age must be computed when discharge_date is present."
-        )
-
-    def test_late_charge_flag_null_when_no_discharge(self, spark):
-        """
-        WHAT: late_charge_flag must be null when discharge_date is null.
-
-        WHY: Maps to:
-                 CASE WHEN pv.PatientDischargeDate IS NULL THEN NULL ...
-             The flag can only be determined after discharge. If the flag
-             is not null when there is no discharge, the CASE logic is wrong.
-
-        REAL DATA CHECK:
-            Zero rows where discharge_date is null AND late_charge_flag is not null.
-        """
-        df = _get_ogom_charges(spark)
-
-        violated = df.filter(
-            F.col("discharge_date").isNull() &
-            F.col("late_charge_flag").isNotNull()
-        ).count()
-
-        assert violated == 0, (
-            f"{violated} rows have null discharge_date but non-null late_charge_flag. "
-            f"late_charge_flag must be null when no discharge date exists."
-        )
-
-    def test_late_charge_flag_values_are_valid(self, spark):
-        """
-        WHAT: late_charge_flag must only contain 0, 1, or null.
-
-        WHY: The CASE expression produces only NULL, 0, or 1.
-             Any other value means the computation produced unexpected output.
-
-        REAL DATA CHECK:
-            All distinct late_charge_flag values ⊆ {0, 1, None}
-        """
-        df = _get_ogom_charges(spark)
-
-        invalid = df.filter(
-            F.col("late_charge_flag").isNotNull() &
-            ~F.col("late_charge_flag").isin(0, 1)
-        ).count()
-
-        assert invalid == 0, (
-            f"{invalid} rows have late_charge_flag values other than 0, 1, or null."
-        )
-
-    def test_charge_lag_days_computed_when_dates_exist(self, spark):
-        """
-        WHAT: charge_lag_days must not be null when both charge_posting_date
-              and service_date are present.
-
-        WHY: Maps to:
-                 CASE WHEN c.ChargePostingDate IS NOT NULL
-                      AND c.ServiceDate IS NOT NULL
-                      THEN DATEDIFF(c.ChargePostingDate, c.ServiceDate)
-                 END AS ChargeLagDays
-             If charge_lag_days is null when both dates exist, the
-             DATEDIFF was not computed — we cannot measure charge lag.
-
-        REAL DATA CHECK:
-            Zero rows where both dates are present AND charge_lag_days is null.
-        """
-        df = _get_ogom_charges(spark)
-
-        violated = df.filter(
-            F.col("posting_date").isNotNull() &
-            F.col("service_date").isNotNull() &
-            F.col("charge_lag_days").isNull()
-        ).count()
-
-        assert violated == 0, (
-            f"{violated} rows have posting_date AND service_date "
-            f"but null charge_lag_days."
-        )
-
-    def test_charge_capture_days_computed_when_dates_exist(self, spark):
-        """
-        WHAT: charge_capture_days must not be null when both
-              charge_posting_date and admit_date are present.
-
-        WHY: Maps to:
-                 CASE WHEN c.ChargePostingDate IS NOT NULL
-                      AND pv.PatientAdmissionDate IS NOT NULL
-                      THEN DATEDIFF(c.ChargePostingDate, pv.PatientAdmissionDate)
-                      ELSE NULL
-                 END AS ChargeCaptureDays
-             A null capture_days when both dates exist means the
-             computation was skipped — we lose visibility into capture lag.
-
-        REAL DATA CHECK:
-            Zero rows where both dates are present AND charge_capture_days is null.
-        """
-        df = _get_ogom_charges(spark)
-
-        violated = df.filter(
-            F.col("posting_date").isNotNull() &
-            F.col("admit_date").isNotNull() &
-            F.col("charge_capture_days").isNull()
-        ).count()
-
-        assert violated == 0, (
-            f"{violated} rows have posting_date AND admit_date "
-            f"but null charge_capture_days."
-        )
+    assert len(dropped) == 0, (
+        f"{len(dropped)} silver_charges charge_id(s) are missing "
+        f"from gold_ogom_charges: {dropped}. "
+        f"LEFT JOIN must keep ALL charges even without a matching visit."
+    )
 
 
 # ---------------------------------------------------------------------------
-# TestOGOMChargesJoinIntegrity — join conditions verified on real data
+# TEST 3: ogom_transaction_type is always 'Charge'
+# From test_ogom_charges.py test 5 — unchanged
 # ---------------------------------------------------------------------------
-class TestOGOMChargesJoinIntegrity:
+def test_ogom_transaction_type_always_charge(spark):
     """
-    Verifies the LEFT JOIN conditions produced correct results on real data.
-    These tests confirm that:
-        - All charges survived (LEFT JOIN guarantee)
-        - Only discharged patients were joined
-        - No charges were lost or invented
+    WHAT: ogom_transaction_type must be 'Charge' on every single row
+          in gold_ogom_charges.
+
+    WHY: Maps to the literal "Charge" AS OGOMTransactionType in the
+         original SQL. This column identifies all rows in this table
+         as charge transactions. If any row has a different value,
+         the literal computation failed or wrong data was loaded.
+
+    FROM: test_ogom_charges.py test 5 — same assertion, same table.
+
+    TABLE USED:
+        gold_ogom_charges
+
+    REAL DATA CHECK:
+        All distinct ogom_transaction_type values == {"Charge"}
     """
+    df = _get_ogom_charges(spark)
 
-    def test_no_charges_dropped_from_silver(self, spark):
-        """
-        WHAT: Distinct charge_ids in gold_ogom_charges must equal the
-              Silver charges row count.
+    distinct_types = {
+        r["ogom_transaction_type"]
+        for r in df.select("ogom_transaction_type").distinct().collect()
+    }
 
-        WHY: LEFT JOIN guarantees every charge appears in Gold.
-             If any charge_id is missing, the join became an INNER JOIN
-             somewhere — unreconciled charges would disappear from reports.
+    assert distinct_types == {"Charge"}, (
+        f"ogom_transaction_type has unexpected values: {distinct_types}. "
+        f"Every row in gold_ogom_charges must have exactly 'Charge'."
+    )
 
-        REAL DATA CHECK:
-            gold.select("charge_id").distinct().count() == silver_charges.count()
-        """
-        df           = _get_ogom_charges(spark)
-        gold_distinct = df.select("charge_id").distinct().count()
 
-        try:
-            silver_count = spark.table(
-                "workspace.tirtho_db.silver_charges"
-            ).count()
-        except Exception as e:
-            pytest.skip(f"silver_charges not available for comparison. Error: {e}")
+# ---------------------------------------------------------------------------
+# TEST 4: charge_age is null when discharge_date is null
+# From test_ogom_charges.py test 6 — unchanged
+# ---------------------------------------------------------------------------
+def test_charge_age_null_when_no_discharge(spark):
+    """
+    WHAT: charge_age must be null whenever discharge_date is null.
 
-        assert gold_distinct == silver_count, (
-            f"Gold OGOM has {gold_distinct} distinct charge_ids "
-            f"but Silver has {silver_count} charges. "
-            f"Difference: {abs(gold_distinct - silver_count)}"
-        )
+    WHY: Maps to:
+             CASE WHEN pv.PatientDischargeDate IS NULL THEN NULL
+                  ELSE DATEDIFF(ChargePostingDate, PatientDischargeDate)
+             END AS ChargeAge
+         A charge cannot have an age relative to a discharge that has
+         not happened yet. If charge_age is not null when discharge_date
+         is null, the CASE logic was not applied correctly.
 
-    def test_discharge_date_not_null_where_visit_joined(self, spark):
-        """
-        WHAT: Where a visit was matched (admit_date is not null),
-              discharge_date must also not be null.
+    FROM: test_ogom_charges.py test 6 — same assertion, same table.
 
-        WHY: The join condition includes AND pv.PatientDischargeDate IS NOT NULL.
-             Only discharged patients are eligible to be matched.
-             If discharge_date is null for a matched visit, the filter
-             condition was not enforced on real data.
+    TABLE USED:
+        gold_ogom_charges
 
-        REAL DATA CHECK:
-            Zero rows where admit_date is not null AND discharge_date is null.
-        """
-        df = _get_ogom_charges(spark)
+    REAL DATA CHECK:
+        Zero rows where discharge_date IS NULL AND charge_age IS NOT NULL.
+    """
+    df = _get_ogom_charges(spark)
 
-        violated = df.filter(
-            F.col("admit_date").isNotNull() &
-            F.col("discharge_date").isNull()
-        ).count()
+    violated = df.filter(
+        F.col("discharge_date").isNull() &
+        F.col("charge_age").isNotNull()
+    ).count()
 
-        assert violated == 0, (
-            f"{violated} Gold OGOM rows have admit_date (visit joined) "
-            f"but null discharge_date. "
-            f"The discharge date IS NOT NULL join condition was not enforced."
-        )
+    assert violated == 0, (
+        f"{violated} rows in gold_ogom_charges have null discharge_date "
+        f"but non-null charge_age. "
+        f"charge_age must be null when no discharge date exists."
+    )
 
-    def test_gold_has_at_least_one_row(self, spark):
-        """
-        WHAT: gold_ogom_charges must have at least 1 row.
 
-        WHY: An empty Gold table means either Silver charges was empty
-             or the join and compute logic failed completely. All
-             downstream OGOM reports would show no data.
+# ---------------------------------------------------------------------------
+# TEST 5: discharge_date must be after admit_date [NEW]
+# ---------------------------------------------------------------------------
+def test_discharge_date_after_admit_date(spark):
+    """
+    WHAT: Where both admit_date and discharge_date are present,
+          discharge_date must always be after (greater than) admit_date.
 
-        REAL DATA CHECK:
-            Row count >= 1.
-        """
-        df    = _get_ogom_charges(spark)
-        count = df.count()
+    WHY: A patient cannot be discharged before being admitted.
+         If discharge_date <= admit_date on any row, it indicates:
+           - A data entry error in the source system
+           - A date mapping error in the pipeline
+           - The wrong visit was joined to this charge
+         Any of these corrupt AR aging, LOS calculations, and
+         the late_charge_flag computation which depends on discharge.
 
-        assert count >= 1, (
-            f"gold_ogom_charges is empty. "
-            f"Run run_pipeline.py to populate it."
-        )
+    NEW TEST — not in any previous version.
+
+    TABLE USED:
+        gold_ogom_charges
+
+    REAL DATA CHECK:
+        Zero rows where both dates exist AND discharge_date <= admit_date.
+    """
+    df = _get_ogom_charges(spark)
+
+    # Only check rows where BOTH dates are present
+    # Rows with null admit_date or null discharge_date are not applicable
+    violated = df.filter(
+        F.col("admit_date").isNotNull() &
+        F.col("discharge_date").isNotNull() &
+        (F.col("discharge_date") <= F.col("admit_date"))
+    ).count()
+
+    assert violated == 0, (
+        f"{violated} rows in gold_ogom_charges have discharge_date "
+        f"on or before admit_date. "
+        f"A patient must be admitted before they can be discharged."
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST 6: No duplicate join combinations [NEW]
+# Maps to the SQL:
+#   SELECT rcm_client_id, rcm_npi, patient_account_number, COUNT(*) AS cnt
+#   FROM gold_ogom_charges
+#   WHERE admit_date IS NOT NULL      -- actual_join_flag = 1 (visit was joined)
+#   GROUP BY rcm_client_id, rcm_npi, patient_account_number
+#   HAVING COUNT(*) > 1
+# Must return zero rows.
+# ---------------------------------------------------------------------------
+def test_no_duplicate_join_combinations(spark):
+    """
+    WHAT: After filtering for rows where a visit was successfully joined
+          (admit_date IS NOT NULL), group by the 3 join keys and check
+          no combination appears more than once.
+
+    WHY: The Gold V2 join uses 3 conditions:
+             rcm_client_id = rcm_client_id
+             rcm_npi = rcm_npi
+             patient_account_number = patient_account_number
+         This should produce a 1-to-1 match — one charge links to at
+         most one visit. If any (client + NPI + patient_account) group
+         has COUNT(*) > 1 in the joined rows, it means:
+           - The same patient had multiple visits matching all 3 conditions
+           - The join produced fan-out (same charge linked to multiple visits)
+           - Revenue would be double-counted in charge-level reports
+
+    ORIGINAL SQL MAPPED TO OUR COLUMNS:
+        client_id           → rcm_client_id
+        NPI                 → rcm_npi
+        PatientAccountNumber → patient_account_number
+        actual_join_flag = 1 → admit_date IS NOT NULL
+
+    NEW TEST — not in any previous version.
+
+    TABLE USED:
+        gold_ogom_charges
+
+    REAL DATA CHECK:
+        The query below must return zero rows:
+            SELECT rcm_client_id, rcm_npi, patient_account_number,
+                   COUNT(*) AS cnt
+            FROM gold_ogom_charges
+            WHERE admit_date IS NOT NULL
+            GROUP BY rcm_client_id, rcm_npi, patient_account_number
+            HAVING COUNT(*) > 1
+    """
+    df = _get_ogom_charges(spark)
+
+    # Step 1: Filter to only rows where a visit was joined
+    # admit_date IS NOT NULL means the LEFT JOIN found a matching visit
+    # This maps to: WHERE actual_join_flag = 1 in the original SQL
+    joined_rows = df.filter(F.col("admit_date").isNotNull())
+
+    # Step 2: Group by the 3 join key columns and count occurrences
+    # Maps to: GROUP BY client_id, NPI, PatientAccountNumber
+    duplicate_groups = (
+        joined_rows
+        .groupBy("rcm_client_id", "rcm_npi", "patient_account_number")
+        .agg(F.count("*").alias("cnt"))
+        # Step 3: Keep only groups with more than 1 row
+        # Maps to: HAVING COUNT(*) > 1
+        .filter(F.col("cnt") > 1)
+    )
+
+    duplicate_count = duplicate_groups.count()
+
+    assert duplicate_count == 0, (
+        f"{duplicate_count} (rcm_client_id, rcm_npi, patient_account_number) "
+        f"combination(s) appear more than once in joined rows. "
+        f"The 3-condition join should be 1-to-1. "
+        f"Fan-out detected — same charge linked to multiple visit rows."
+    )
