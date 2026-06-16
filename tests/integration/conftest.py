@@ -173,21 +173,29 @@ def _parse_test_info(nodeid: str) -> dict:
         pytest identifies each test by a node ID string. We need to extract
         structured fields from it to store in the audit table columns.
 
-    NODE ID FORMATS:
-        Bronze (parametrized):
+    NODE ID FORMATS — 3 patterns handled:
+
+        Pattern 1: class-based parametrized (Bronze)
             tests/integration/test_bronze_realdata.py
             ::TestBronzeIngestion
-            ::test_validate_file_format_compatibility[charges]
+            ::test_duplicate_check[charges]
+            parts = [file, class, test[table]]
 
-        Silver (not parametrized):
+        Pattern 2: class-based not parametrized (Silver)
             tests/integration/test_silver_realdata.py
             ::TestSilverServiceDate
             ::test_service_date_is_datetime
+            parts = [file, class, test]
 
-        Gold (not parametrized):
-            tests/integration/test_gold_realdata.py
-            ::TestGoldReconciliation
-            ::test_charge_count_matches_silver
+        Pattern 3: plain function — no class (Gold ogom)
+            tests/integration/gold/test_ogom_charges.py
+            ::test_no_new_charge_ids_in_gold
+            parts = [file, test]
+
+    WHY PATTERN 3 WAS RETURNING unknown:
+        Old code assumed parts[2] was the test name (class-based format).
+        For plain functions, parts[1] IS the test name and parts[2] does
+        not exist — so table_name and layer both fell back to "unknown".
 
     Args:
         nodeid (str): Full pytest node ID string.
@@ -195,12 +203,13 @@ def _parse_test_info(nodeid: str) -> dict:
     Returns:
         dict: layer, table_name, test_class, test_name.
     """
-    # Split node ID into its components
+    # Split node ID into its path components
     parts = nodeid.split("::")
 
-    # ── Determine layer from file name ──────────────────────────────────────
+    # ── Determine layer from file name ───────────────────────────────────────
+    # Extract just the filename (last segment before .py)
     file_name = parts[0].split("/")[-1].replace(".py", "")
-    # File names: test_bronze_realdata, test_silver_realdata, test_gold_realdata
+
     if "bronze" in file_name:
         layer = "bronze"
     elif "silver" in file_name:
@@ -210,25 +219,35 @@ def _parse_test_info(nodeid: str) -> dict:
     else:
         layer = "unknown"
 
-    # ── Extract test class (second part) ────────────────────────────────────
-    test_class = parts[1] if len(parts) > 1 else "unknown"
+    # ── Detect which pattern we are dealing with ─────────────────────────────
+    # Pattern 3: plain function — only 2 parts (file + test_name)
+    # Pattern 1/2: class-based — 3 parts (file + class + test_name)
+    if len(parts) == 2:
+        # Pattern 3: tests/integration/gold/test_ogom_charges.py::test_name
+        # parts[1] is the test name directly — no class wrapper
+        test_class = "none"
+        test_part  = parts[1]
+    else:
+        # Pattern 1/2: file::ClassName::test_name or file::ClassName::test_name[table]
+        test_class = parts[1]
+        test_part  = parts[2]
 
-    # ── Extract test name and table_name ────────────────────────────────────
-    # The last part may have [table_name] suffix from pytest parametrize
-    test_part = parts[2] if len(parts) > 2 else parts[-1]
-
+    # ── Extract test name and table_name from the last part ──────────────────
     if "[" in test_part:
-        # Parametrized test — table name is inside the brackets
-        # e.g. test_validate_file_format_compatibility[charges]
+        # Parametrized test — table name is inside the square brackets
+        # e.g. test_duplicate_check[charges] → test_name=test_duplicate_check, table=charges
         test_name  = test_part.split("[")[0]
         table_name = test_part.split("[")[1].rstrip("]")
     else:
         # Not parametrized — derive table name from layer
         test_name = test_part
-        if layer == "silver":
+        if layer == "bronze":
+            table_name = "bronze_charges + bronze_patientvisits"
+        elif layer == "silver":
             table_name = "silver_charges"
         elif layer == "gold":
-            table_name = "gold_rcm_summary"
+            # Gold tests run on gold_ogom_charges
+            table_name = "gold_ogom_charges"
         else:
             table_name = "unknown"
 
