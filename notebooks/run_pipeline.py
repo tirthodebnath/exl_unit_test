@@ -23,6 +23,7 @@ BRONZE_PATIENTVISITS_TABLE  = f"{CATALOG}.{SCHEMA}.bronze_patientvisits"
 SILVER_CHARGES_TABLE        = f"{CATALOG}.{SCHEMA}.silver_charges"
 SILVER_PATIENTVISITS_TABLE  = f"{CATALOG}.{SCHEMA}.silver_patientvisits"
 GOLD_RCM_TABLE              = f"{CATALOG}.{SCHEMA}.gold_rcm_summary"
+GOLD_RCM_TABLE_V2           = f"{CATALOG}.{SCHEMA}.gold_rcm_summary_v2"
 
 print(f"Charges landing:       {CHARGES_LANDING}")
 print(f"PatientVisits landing: {PATIENTVISITS_LANDING}")
@@ -64,7 +65,7 @@ from pyspark.sql import SparkSession
 from src.bronze.ingest import ingest_charges, ingest_patientvisits
 from src.silver.transform_charges import build_silver_charges
 from src.silver.transform_patientvisits import build_silver_patientvisits
-from src.gold.aggregate import build_rcm_summary
+from src.gold.aggregate import build_rcm_summary, build_rcm_summary_v2
 
 spark = SparkSession.builder.getOrCreate()
 print("Imports OK")
@@ -143,4 +144,15 @@ spark.table(GOLD_RCM_TABLE).select(
     "pv_has_insurance_balance",
 ).show(10, truncate=False)
 
+# Gold V2 — enhanced join (3 conditions + discharge filter)
+gold_v2 = build_rcm_summary_v2(
+    spark.table(SILVER_CHARGES_TABLE),
+    spark.table(SILVER_PATIENTVISITS_TABLE),
+)
+print(f"Gold V2 RCM summary: {gold_v2.count()} rows")
+
+gold_v2.write.format("delta").mode("overwrite") \
+    .saveAsTable(GOLD_RCM_TABLE_V2)
+
+print("Gold V2 table written.")
 print("Pipeline complete.")
