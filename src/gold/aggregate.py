@@ -347,13 +347,17 @@ def build_ogom_charges(
             F.col("pv_patient_discharge_date").isNull(), F.lit(None)
         ).when(
             # Outpatient/Emergency: late if posted > 5 days after discharge
-            F.upper(F.col("patient_type_code")).isin("O", "E") &
+            # FIX: each condition wrapped in () so & binds correctly.
+            # Without () Python evaluates: isin("O","E") == (lit("I") & datediff > 5)
+            # which tries to cast string to boolean → CAST_INVALID_INPUT error.
+            (F.upper(F.col("patient_type_code")).isin("O", "E")) &
             (F.datediff(F.col("charge_posting_date"),
                         F.col("pv_patient_discharge_date")) > 5),
             F.lit(1)
         ).when(
             # Inpatient: late if posted > 3 days after discharge
-            F.upper(F.col("patient_type_code")) == F.lit("I") &
+            # Same fix: (condition1) & (condition2)
+            (F.upper(F.col("patient_type_code")) == F.lit("I")) &
             (F.datediff(F.col("charge_posting_date"),
                         F.col("pv_patient_discharge_date")) > 3),
             F.lit(1)
