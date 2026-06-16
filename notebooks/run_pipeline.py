@@ -65,7 +65,7 @@ from pyspark.sql import SparkSession
 from src.bronze.ingest import ingest_charges, ingest_patientvisits
 from src.silver.transform_charges import build_silver_charges
 from src.silver.transform_patientvisits import build_silver_patientvisits
-from src.gold.aggregate import build_rcm_summary, build_rcm_summary_v2
+from src.gold.aggregate import build_rcm_summary, build_rcm_summary_v2, build_ogom_charges
 
 spark = SparkSession.builder.getOrCreate()
 print("Imports OK")
@@ -155,4 +155,13 @@ gold_v2.write.format("delta").mode("overwrite") \
     .saveAsTable(GOLD_RCM_TABLE_V2)
 
 print("Gold V2 table written.")
+# Gold OGOM Charges — full column set based on bassett_epic_acute_gold SQL
+ogom_charges = build_ogom_charges(
+    spark.table(SILVER_CHARGES_TABLE),
+    spark.table(SILVER_PATIENTVISITS_TABLE),
+)
+print(f"Gold OGOM charges: {ogom_charges.count()} rows")
+ogom_charges.write.format("delta").mode("overwrite") \
+    .saveAsTable(f"{CATALOG}.{SCHEMA}.gold_ogom_charges")
+print("Gold OGOM charges table written.")
 print("Pipeline complete.")

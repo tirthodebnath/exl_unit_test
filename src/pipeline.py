@@ -17,7 +17,7 @@ from pyspark.sql import DataFrame, SparkSession
 from src.bronze.ingest import ingest_charges, ingest_patientvisits
 from src.silver.transform_charges import build_silver_charges
 from src.silver.transform_patientvisits import build_silver_patientvisits
-from src.gold.aggregate import build_rcm_summary, build_rcm_summary_v2
+from src.gold.aggregate import build_rcm_summary, build_rcm_summary_v2, build_ogom_charges
 
 
 def run_pipeline(
@@ -49,4 +49,6 @@ def run_pipeline(
         "rcm_summary":          build_rcm_summary(silver_charges, silver_patientvisits),
         # Enhanced Gold join — 3 conditions + discharged patients only
         "rcm_summary_v2":       build_rcm_summary_v2(silver_charges, silver_patientvisits),
+        # OGOM Charges Gold — full column set from charges + patientvisits
+        "ogom_charges":         build_ogom_charges(silver_charges, silver_patientvisits),
     }

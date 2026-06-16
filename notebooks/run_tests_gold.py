@@ -75,7 +75,8 @@ print(f"Notebook: {notebook_link}")
 # Check all required Gold tables exist
 for t in ["workspace.tirtho_db.silver_charges",
           "workspace.tirtho_db.gold_rcm_summary",
-          "workspace.tirtho_db.gold_rcm_summary_v2"]:
+          "workspace.tirtho_db.gold_rcm_summary_v2",
+          "workspace.tirtho_db.gold_ogom_charges"]:
     try:
         spark.table(t).limit(1).count()
         print(f"✓ {t}")
@@ -90,6 +91,7 @@ print("RUNNING GOLD DATA QUALITY TESTS")
 print("=" * 60)
 print("  test_charges.py      — charge reconciliation (6 tests)")
 print("  test_patientvisits.py — visit join correctness (6 tests)")
+print("  test_ogom_charges.py  — OGOM charges Gold table (11 tests)")
 print()
 
 exit_code = pytest.main([
